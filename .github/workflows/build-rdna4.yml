@@ -1,0 +1,452 @@
+name: Build llama.cpp RDNA4 Boosts - Windows ROCm 10
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpu_target:
+        description: RDNA4 target (gfx1201 = RX 9070/9070 XT/R9700; gfx1200 = RX 9060 XT)
+        required: true
+        default: gfx1201
+        type: choice
+        options:
+          - gfx1201
+          - gfx1200
+      boosts_ref:
+        description: stew675/llama-cpp-rdna-boosts commit/ref to build
+        required: true
+        default: ee2daacef09c7b50884088e1a03e37e63e9f0cbe
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rdna4-${{ github.ref }}-${{ inputs.gpu_target }}
+  cancel-in-progress: false
+
+env:
+  LLAMA_REPO: https://github.com/ggml-org/llama.cpp.git
+  LLAMA_BASE: 9cffdcc80
+  BOOSTS_REPO: https://github.com/stew675/llama-cpp-rdna-boosts.git
+  ROCM_VERSION: 10.0.0
+  ROCM_INDEX: https://stable.repo.amd.com/rocm/whl-next/
+  GPU_TARGET: ${{ inputs.gpu_target }}
+  BOOSTS_REF: ${{ inputs.boosts_ref }}
+
+jobs:
+  build:
+    name: Win11 ROCm 10 / ${{ inputs.gpu_target }}
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Prepare source trees
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config --global core.autocrlf false
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git clone $env:LLAMA_REPO llama.cpp
+          Set-Location llama.cpp
+          git checkout --detach $env:LLAMA_BASE
+          $llamaBaseSha = (git rev-parse HEAD).Trim()
+          Set-Location ..
+
+          git clone $env:BOOSTS_REPO rdna-boosts
+          Set-Location rdna-boosts
+          git checkout --detach $env:BOOSTS_REF
+          $boostsSha = (git rev-parse HEAD).Trim()
+          Set-Location ..
+
+          "LLAMA_BASE_SHA=$llamaBaseSha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "BOOSTS_SHA=$boostsSha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "llama.cpp base: $llamaBaseSha"
+          Write-Host "RDNA boosts:     $boostsSha"
+
+      - name: Verify and apply all 13 RDNA boost patches
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          $patchDir = Join-Path $env:GITHUB_WORKSPACE 'rdna-boosts\patches'
+          $patches = @(Get-ChildItem -Path $patchDir -Filter '*.patch' -File | Sort-Object Name)
+
+          Write-Host "Patch files found: $($patches.Count)"
+          $patches | ForEach-Object { Write-Host "  $($_.Name)" }
+
+          if ($patches.Count -ne 13) {
+            throw "Expected exactly 13 delivery patches, found $($patches.Count). Refusing to build an unknown patch set."
+          }
+          if ($patches[0].Name -notlike '0001-*' -or $patches[12].Name -notlike '0013-*') {
+            throw 'Patch sequence is not 0001 through 0013.'
+          }
+
+          Set-Location (Join-Path $env:GITHUB_WORKSPACE 'llama.cpp')
+          git checkout -b rdna-boosts-build
+
+          $patchPaths = @($patches | ForEach-Object { $_.FullName })
+          try {
+            git am $patchPaths
+          }
+          catch {
+            Write-Host 'git am failed. Showing current patch status:'
+            git status
+            git am --show-current-patch=diff 2>$null | Select-Object -First 200
+            git am --abort 2>$null
+            throw
+          }
+
+          $applied = [int](git rev-list --count "$env:LLAMA_BASE_SHA..HEAD")
+          if ($applied -ne 13) {
+            throw "Expected 13 applied commits, got $applied."
+          }
+
+          $dirty = git status --porcelain
+          if ($dirty) {
+            throw "Patched tree is dirty after git am:`n$dirty"
+          }
+
+          git diff --check "$env:LLAMA_BASE_SHA..HEAD"
+          $patchedSha = (git rev-parse HEAD).Trim()
+          "PATCHED_SHA=$patchedSha" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Patched llama.cpp HEAD: $patchedSha"
+
+      - name: Install ROCm 10.0.0 SDK for selected RDNA4 target
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          New-Item -Path 'C:\TheRock\build' -ItemType Directory -Force | Out-Null
+          python -m venv C:\TheRock\build\.venv
+          & C:\TheRock\build\.venv\Scripts\Activate.ps1
+          python -m pip install --upgrade pip
+
+          # ROCm Core SDK + libraries + development files + device-specific kernels.
+          $rocmPackage = "rocm[libraries,devel,device-$env:GPU_TARGET]==$env:ROCM_VERSION"
+          Write-Host "Installing $rocmPackage"
+          python -m pip install --index-url $env:ROCM_INDEX $rocmPackage
+
+          rocm-sdk init
+
+          $rocmPath = (rocm-sdk path --root).Trim()
+          $cmakePath = (rocm-sdk path --cmake).Trim()
+          $binPath = (rocm-sdk path --bin).Trim()
+
+          if (-not $rocmPath -or -not (Test-Path $rocmPath)) { throw 'Invalid ROCm root.' }
+          if (-not $cmakePath -or -not (Test-Path $cmakePath)) { throw 'Invalid ROCm CMake path.' }
+          if (-not $binPath -or -not (Test-Path $binPath)) { throw 'Invalid ROCm bin path.' }
+
+          Write-Host "ROCm root:  $rocmPath"
+          Write-Host "ROCm cmake: $cmakePath"
+          Write-Host "ROCm bin:   $binPath"
+
+          "ROCM_ROOT=$rocmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ROCM_BIN=$binPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HIP_PATH=$rocmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ROCM_PATH=$rocmPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CMAKE_PREFIX_PATH=$cmakePath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HIP_DEVICE_LIB_PATH=$rocmPath\lib\llvm\amdgcn\bitcode" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "HIP_PLATFORM=amd" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "LLVM_PATH=$rocmPath\lib\llvm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          $binPath | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          'C:\TheRock\build\.venv\Scripts' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+          & "$rocmPath\lib\llvm\bin\clang.exe" --version
+
+      - name: Install Ninja for HIP backend build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          choco install ninja -y --no-progress
+          ninja --version
+
+      - name: Build patched Windows CPU/tools package
+        shell: pwsh
+        working-directory: llama.cpp
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          # Build the patched front-end/tools separately with MSVC. This mirrors
+          # upstream's Windows release architecture: CPU/tool binaries are built
+          # once and dynamically load a separately built ggml-hip backend.
+          cmake -S . -B build-cpu -G 'Visual Studio 17 2022' -A x64 `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
+            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_EXAMPLES=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_CURL=OFF `
+            -DGGML_RPC=OFF
+
+          cmake --build build-cpu --config Release --parallel $env:NUMBER_OF_PROCESSORS `
+            --target llama-server llama-cli llama-bench
+
+      - name: Build patched ROCm 10 HIP backend
+        shell: pwsh
+        working-directory: llama.cpp
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          # This follows the current upstream ROCm 10 Windows release model:
+          # build ggml-hip as a dynamic backend and merge it with the patched
+          # Windows tool binaries from the previous step.
+          cmake -S . -B build-hip -G 'Ninja Multi-Config' `
+            -DCMAKE_PREFIX_PATH="$env:ROCM_ROOT" `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_CPU=OFF `
+            -DGGML_HIP=ON `
+            -DGGML_HIP_RCCL=OFF `
+            -DCMAKE_C_COMPILER="$env:ROCM_ROOT\lib\llvm\bin\clang.exe" `
+            -DCMAKE_CXX_COMPILER="$env:ROCM_ROOT\lib\llvm\bin\clang++.exe" `
+            -DCMAKE_C_FLAGS='-Wno-error=incompatible-pointer-types' `
+            -DCMAKE_HIP_COMPILER="$env:ROCM_ROOT\lib\llvm\bin\clang.exe" `
+            -DHIP_PATH="$env:ROCM_ROOT" `
+            -DAMDGPU_TARGETS="$env:GPU_TARGET" `
+            -DGPU_TARGETS="$env:GPU_TARGET"
+
+          cmake --build build-hip --config Release --parallel $env:NUMBER_OF_PROCESSORS --target ggml-hip
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cpuBin = Join-Path $env:GITHUB_WORKSPACE 'llama.cpp\build-cpu\bin\Release'
+          $hipBin = Join-Path $env:GITHUB_WORKSPACE 'llama.cpp\build-hip\bin\Release'
+
+          $requiredCpu = @('llama-server.exe', 'llama-cli.exe', 'llama-bench.exe')
+          foreach ($name in $requiredCpu) {
+            $path = Join-Path $cpuBin $name
+            if (-not (Test-Path $path)) { throw "Required CPU/tool output missing: $path" }
+            Get-Item $path | Format-Table Name, Length, LastWriteTime -AutoSize
+          }
+
+          $hipDll = Join-Path $hipBin 'ggml-hip.dll'
+          if (-not (Test-Path $hipDll)) { throw "Required HIP backend missing: $hipDll" }
+          Get-Item $hipDll | Format-Table Name, Length, LastWriteTime -AutoSize
+
+      - name: Package slim and portable builds
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $cpuBin = Join-Path $workspace 'llama.cpp\build-cpu\bin\Release'
+          $hipBin = Join-Path $workspace 'llama.cpp\build-hip\bin\Release'
+          $outRoot = Join-Path $workspace 'artifacts'
+          $slim = Join-Path $outRoot "llama-rdna-boosts-win-rocm10-$env:GPU_TARGET-slim"
+          $portable = Join-Path $outRoot "llama-rdna-boosts-win-rocm10-$env:GPU_TARGET-portable"
+          New-Item -ItemType Directory -Force -Path $slim, $portable | Out-Null
+
+          # Patched front-end/tools and their CPU/common DLLs.
+          $wantedExe = @('llama-server.exe', 'llama-cli.exe', 'llama-bench.exe')
+          foreach ($dest in @($slim, $portable)) {
+            foreach ($exe in $wantedExe) {
+              Copy-Item (Join-Path $cpuBin $exe) $dest -Force
+            }
+            Get-ChildItem -Path $cpuBin -Filter '*.dll' -File | Copy-Item -Destination $dest -Force
+            Copy-Item (Join-Path $hipBin 'ggml-hip.dll') $dest -Force
+          }
+
+          # Match upstream's minimal ROCm runtime bundling for the slim package.
+          # These three must sit beside the EXE to beat incompatible System32
+          # copies in Windows' DLL search order.
+          $criticalRuntime = @('amdhip64_7.dll', 'rocm_kpack.dll', 'amd_comgr.dll')
+          foreach ($name in $criticalRuntime) {
+            $src = Join-Path $env:ROCM_BIN $name
+            if (-not (Test-Path $src)) { throw "Expected ROCm runtime DLL missing: $src" }
+            Copy-Item $src $slim -Force
+          }
+
+          # Portable package: include every ROCm runtime DLL next to the EXEs.
+          # This deliberately includes hipBLAS/rocBLAS instead of depending on
+          # an external ROCm PATH, addressing the packaging failure in #26996.
+          Get-ChildItem -Path $env:ROCM_BIN -Filter '*.dll' -File | Copy-Item -Destination $portable -Force
+
+          function Copy-KernelTree {
+            param(
+              [Parameter(Mandatory=$true)][string]$Name,
+              [Parameter(Mandatory=$true)][string]$DestinationRoot
+            )
+
+            $directCandidates = @(
+              (Join-Path $env:ROCM_BIN $Name),
+              (Join-Path $env:ROCM_ROOT "bin\$Name"),
+              (Join-Path $env:ROCM_ROOT "lib\$Name"),
+              (Join-Path $env:ROCM_ROOT "lib64\$Name")
+            ) | Select-Object -Unique
+
+            foreach ($candidate in $directCandidates) {
+              if (Test-Path (Join-Path $candidate 'library')) {
+                $dest = Join-Path $DestinationRoot $Name
+                New-Item -ItemType Directory -Force -Path $dest | Out-Null
+                Copy-Item (Join-Path $candidate 'library') $dest -Recurse -Force
+                Write-Host "Copied $Name kernel tree from $candidate"
+                return
+              }
+            }
+
+            # TheRock wheel layouts can move. Fall back to locating <name>\library
+            # anywhere under the expanded ROCm SDK tree.
+            $libraries = @(Get-ChildItem -Path $env:ROCM_ROOT -Directory -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -eq 'library' -and $_.Parent.Name -eq $Name })
+            if ($libraries.Count -lt 1) {
+              throw "Could not locate $Name/library under ROCm root; portable package would be incomplete."
+            }
+
+            $dest = Join-Path $DestinationRoot "$Name\library"
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            foreach ($libdir in $libraries) {
+              Copy-Item (Join-Path $libdir.FullName '*') $dest -Recurse -Force
+              Write-Host "Merged $Name kernels from $($libdir.FullName)"
+            }
+          }
+
+          Copy-KernelTree -Name 'rocblas' -DestinationRoot $portable
+
+          # hipBLASLt data is included when present. ggml-hip's required baseline
+          # path is hipBLAS/rocBLAS, so absence of this optional data tree alone
+          # does not invalidate the package.
+          try {
+            Copy-KernelTree -Name 'hipblaslt' -DestinationRoot $portable
+          }
+          catch {
+            Write-Warning "hipblaslt/library was not found: $($_.Exception.Message)"
+          }
+
+          # Hard gate for the exact runtime pieces missing in llama.cpp #26996.
+          $mustHavePortable = @('ggml-hip.dll', 'amdhip64_7.dll', 'hipblas.dll', 'rocblas.dll')
+          foreach ($name in $mustHavePortable) {
+            if (-not (Test-Path (Join-Path $portable $name))) {
+              throw "Portable package is missing required DLL: $name"
+            }
+          }
+          $rocblasLibrary = Join-Path $portable 'rocblas\library'
+          if (-not (Test-Path $rocblasLibrary) -or -not (Get-ChildItem $rocblasLibrary -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+            throw 'Portable package is missing the rocBLAS kernel library tree.'
+          }
+
+          $buildInfo = @"
+          llama.cpp RDNA4 Boosts - Windows build
+          =======================================
+          Build date (UTC): $(Get-Date -AsUTC -Format 'yyyy-MM-ddTHH:mm:ssZ')
+          GPU target:       $env:GPU_TARGET
+          ROCm SDK:         $env:ROCM_VERSION
+          llama.cpp base:   $env:LLAMA_BASE_SHA
+          boosts repo:      $env:BOOSTS_SHA
+          patched HEAD:     $env:PATCHED_SHA
+          Packaging model:  patched MSVC tools + patched dynamic ggml-hip backend
+          RCCL:             OFF (Windows-friendly first build)
+          CURL:             OFF (local GGUF usage; fewer runtime dependencies)
+
+          Sources:
+          https://github.com/ggml-org/llama.cpp
+          https://github.com/stew675/llama-cpp-rdna-boosts
+          "@
+
+          $portableNotes = @"
+          PORTABLE PACKAGE
+          ================
+          This package intentionally includes ROCm 10 runtime DLLs plus the rocBLAS
+          kernel library tree for $env:GPU_TARGET. It is designed to avoid the missing
+          hipBLAS/rocBLAS packaging failure described in llama.cpp issue #26996.
+
+          Test on the RDNA4 Windows 11 machine:
+              TEST-RDNA4.cmd
+
+          Or from PowerShell:
+              .\llama-server.exe --list-devices
+
+          A GitHub-hosted Windows runner does not provide an RDNA4 GPU, so final GPU
+          enumeration can only be verified on the target PC.
+          "@
+
+          $slimNotes = @"
+          SLIM PACKAGE
+          ============
+          This mirrors upstream's minimal ROCm packaging style. ROCm 10 libraries
+          (hipBLAS/rocBLAS and their device kernels) must already be installed and on
+          PATH on the Windows machine. Prefer the portable artifact for first testing.
+          "@
+
+          $testCmd = @"
+          @echo off
+          setlocal
+          set "PATH=%~dp0;%PATH%"
+          echo Testing RDNA4 device detection...
+          "%~dp0llama-server.exe" --list-devices
+          echo.
+          pause
+          "@
+
+          $runCmd = @"
+          @echo off
+          setlocal
+          set "PATH=%~dp0;%PATH%"
+          "%~dp0llama-server.exe" %*
+          "@
+
+          foreach ($dest in @($slim, $portable)) {
+            $buildInfo | Set-Content -Path (Join-Path $dest 'BUILD-INFO.txt') -Encoding utf8
+            $testCmd | Set-Content -Path (Join-Path $dest 'TEST-RDNA4.cmd') -Encoding ascii
+            $runCmd | Set-Content -Path (Join-Path $dest 'RUN-LLAMA-SERVER.cmd') -Encoding ascii
+            Copy-Item (Join-Path $workspace 'llama.cpp\LICENSE') $dest -Force
+            if (Test-Path (Join-Path $workspace 'rdna-boosts\LICENSE')) {
+              Copy-Item (Join-Path $workspace 'rdna-boosts\LICENSE') (Join-Path $dest 'LICENSE-rdna-boosts') -Force
+            }
+          }
+          $portableNotes | Set-Content -Path (Join-Path $portable 'PORTABLE-NOTES.txt') -Encoding utf8
+          $slimNotes | Set-Content -Path (Join-Path $slim 'SLIM-NOTES.txt') -Encoding utf8
+
+          # Check that the fully staged portable package can at least start. The
+          # runner has no RDNA4 device, so --version is the correct CI smoke test.
+          Push-Location $portable
+          try {
+            & '.\llama-cli.exe' --version
+          }
+          finally {
+            Pop-Location
+          }
+
+          # Hash the key binaries inside each artifact for provenance.
+          foreach ($dest in @($slim, $portable)) {
+            Get-ChildItem -Path $dest -File |
+              Where-Object { $_.Extension -in '.exe', '.dll' } |
+              Get-FileHash -Algorithm SHA256 |
+              ForEach-Object { "$($_.Hash.ToLower())  $([System.IO.Path]::GetFileName($_.Path))" } |
+              Set-Content -Path (Join-Path $dest 'SHA256SUMS.txt') -Encoding ascii
+          }
+
+          Write-Host 'Slim package:'
+          Get-ChildItem $slim | Select-Object Name, Length | Format-Table -AutoSize
+          Write-Host 'Portable package top level:'
+          Get-ChildItem $portable | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: Upload portable RDNA4 package
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-rdna-boosts-win-rocm10-${{ inputs.gpu_target }}-portable
+          path: artifacts/llama-rdna-boosts-win-rocm10-${{ inputs.gpu_target }}-portable/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 14
+
+      - name: Upload slim RDNA4 package
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-rdna-boosts-win-rocm10-${{ inputs.gpu_target }}-slim
+          path: artifacts/llama-rdna-boosts-win-rocm10-${{ inputs.gpu_target }}-slim/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 14
