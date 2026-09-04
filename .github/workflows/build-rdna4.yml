@@ -274,6 +274,42 @@ jobs:
           # an external ROCm PATH, addressing the packaging failure in #26996.
           Get-ChildItem -Path $env:ROCM_BIN -Filter '*.dll' -File | Copy-Item -Destination $portable -Force
 
+          # GitHub's windows-2022 image has OpenSSL on PATH. That can hide a
+          # missing-runtime problem during CI. Bundle the OpenSSL 3 runtime DLLs
+          # explicitly so the artifacts also start on a clean Windows 11 machine.
+          $opensslDlls = @('libssl-3-x64.dll', 'libcrypto-3-x64.dll')
+          $opensslSearchRoots = @(
+            'C:\Program Files\OpenSSL\bin',
+            'C:\Program Files\OpenSSL-Win64\bin',
+            'C:\Program Files\Git\mingw64\bin',
+            'C:\Strawberry\c\bin'
+          )
+
+          foreach ($dll in $opensslDlls) {
+            $src = $null
+            foreach ($root in $opensslSearchRoots) {
+              $candidate = Join-Path $root $dll
+              if (Test-Path $candidate) {
+                $src = $candidate
+                break
+              }
+            }
+
+            if (-not $src) {
+              $src = Get-ChildItem -Path 'C:\Program Files' -Filter $dll -File -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1 -ExpandProperty FullName
+            }
+
+            if (-not $src) {
+              throw "Could not locate required OpenSSL runtime DLL on runner: $dll"
+            }
+
+            foreach ($dest in @($slim, $portable)) {
+              Copy-Item $src $dest -Force
+            }
+            Write-Host "Bundled OpenSSL runtime: $src"
+          }
+
           function Copy-KernelTree {
             param(
               [Parameter(Mandatory=$true)][string]$Name,
@@ -409,13 +445,20 @@ jobs:
           $portableNotes | Set-Content -Path (Join-Path $portable 'PORTABLE-NOTES.txt') -Encoding utf8
           $slimNotes | Set-Content -Path (Join-Path $slim 'SLIM-NOTES.txt') -Encoding utf8
 
-          # Check that the fully staged portable package can at least start. The
-          # runner has no RDNA4 device, so --version is the correct CI smoke test.
+          # Check that the fully staged portable package can start without
+          # borrowing developer/runtime DLLs from the GitHub runner PATH.
+          # Keep only the artifact itself plus standard Windows locations.
           Push-Location $portable
+          $savedPath = $env:PATH
           try {
+            $env:PATH = "$portable;C:\Windows\System32;C:\Windows"
             & '.\llama-cli.exe' --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "Portable clean-PATH smoke test failed with exit code $LASTEXITCODE"
+            }
           }
           finally {
+            $env:PATH = $savedPath
             Pop-Location
           }
 
