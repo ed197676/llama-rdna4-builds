@@ -22,7 +22,7 @@ on:
       boosts_release:
         description: Published stew675/llama-cpp-rdna-boosts release tag
         required: true
-        default: v16-ebbb18522-r2
+        default: v16-ebbb18522-r9
         type: string
 
 permissions:
@@ -545,5 +545,5 @@ jobs:
           name: ${{ env.PORTABLE_NAME }}
           path: artifacts/${{ env.PORTABLE_NAME }}/
           if-no-files-found: error
-          compression-level: 6
-          retention-days: 3
+          compression-level: 7
+          retention-days: 7
