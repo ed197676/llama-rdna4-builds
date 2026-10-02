@@ -22,7 +22,7 @@ on:
       boosts_release:
         description: Published stew675/llama-cpp-rdna-boosts release tag
         required: true
-        default: v16-ebbb18522-r9
+        default: v16-84e76d8a2-r30
         type: string
 
 permissions:
